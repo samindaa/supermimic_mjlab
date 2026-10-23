@@ -1,4 +1,4 @@
-"""Motion-tracking simulator on Isaac Lab 3 (kit-less, Newton physics with the MuJoCo-Warp solver).
+"""Motion-tracking simulator on mjlab (MuJoCo-Warp).
 
 The environment is a thin batched wrapper: it applies the joint setpoint, steps MuJoCo-Warp, labels
 the transition with the analytic reward/termination of :mod:`supermimic.mdp`, and resets episodes to
@@ -7,51 +7,40 @@ reference-motion states drawn by return-based bin sampling (paper Appendix D.1).
 
 from __future__ import annotations
 
-import math
-
 import torch
-import warp as wp
-from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
-from newton import ModelFlags
-
-import isaaclab.sim as sim_utils
-from isaaclab.assets import AssetBaseCfg
-from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim import SimulationContext
-from isaaclab.utils import configclass, instantiate, replace
+from mjlab.managers.event_manager import RecomputeLevel
+from mjlab.scene import Scene, SceneCfg
+from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
+from mjlab.terrains import TerrainEntityCfg
 
 from .mdp import MAX_STEP_REWARD, MDP, flatten_state
 from .motion import CONTROL_DT, MotionLib
-from .robot import G1_CFG, G1_JOINT_NAMES, action_scale
+from .robot import G1_JOINT_NAMES, action_scale, g1_cfg
 from .rotations import mat_to_quat, quat_to_mat, so3_exp
 
-
-@configclass
-class TrackingSceneCfg(InteractiveSceneCfg):
-    ground = AssetBaseCfg(prim_path="/World/ground", spawn=sim_utils.GroundPlaneCfg())
-    robot = replace(G1_CFG, prim_path="{ENV_REGEX_NS}/Robot")
+PHYSICS_DT = 0.005
+DECIMATION = round(CONTROL_DT / PHYSICS_DT)  # 4 substeps of 5 ms per 50 Hz control step
 
 
-def make_sim(device: str, args) -> SimulationContext:
-    physics = NewtonCfg(
-        solver_cfg=MJWarpSolverCfg(njmax=500, nconmax=128, cone="pyramidal", integrator="implicitfast", use_mujoco_contacts=True),
-        num_substeps=4,
+def make_sim_cfg() -> SimulationCfg:
+    # implicitfast + pyramidal cones as before; solver iterations as in mjlab's G1 tracking task
+    return SimulationCfg(
+        njmax=500,
+        nconmax=128,
+        mujoco=MujocoCfg(timestep=PHYSICS_DT, integrator="implicitfast", cone="pyramidal", iterations=10, ls_iterations=20),
     )
-    return sim_utils.SimulationCfg(dt=CONTROL_DT, device=device, physics=physics)
 
 
 class TrackingSim:
-    """Batched G1 motion-tracking simulator.
+    """Batched G1 motion-tracking simulator."""
 
-    Must be constructed inside ``launch_simulation(sim_cfg, ...)`` with ``sim_cfg`` from :func:`make_sim`.
-    """
-
-    def __init__(self, sim_cfg, num_envs: int, motion: MotionLib, mdp: MDP, gamma: float = 0.99, eval_mode: bool = False,
+    def __init__(self, device: str, num_envs: int, motion: MotionLib, mdp: MDP, gamma: float = 0.99, eval_mode: bool = False,
                  max_episode_steps: int = 500, reset_noise: bool = True):
-        self.device = sim_cfg.device
-        self.sim = SimulationContext(sim_cfg)
-        self.scene = instantiate(TrackingSceneCfg(num_envs=num_envs, env_spacing=0.0, replicate_physics=True))
-        self.sim.reset()
+        self.device = device
+        scene_cfg = SceneCfg(num_envs=num_envs, env_spacing=0.0, terrain=TerrainEntityCfg(terrain_type="plane"), entities={"robot": g1_cfg()})
+        self.scene = Scene(scene_cfg, device=device)
+        self.sim = Simulation(num_envs=num_envs, cfg=make_sim_cfg(), spec=self.scene.spec, device=device)
+        self.scene.initialize(mj_model=self.sim.mj_model, model=self.sim.model, data=self.sim.data)
         self.robot = self.scene["robot"]
         assert list(self.robot.joint_names) == G1_JOINT_NAMES, self.robot.joint_names
         self.N = num_envs
@@ -60,13 +49,16 @@ class TrackingSim:
         self.max_episode_steps = max_episode_steps if not eval_mode else 10**9
         self.reset_noise = reset_noise and not eval_mode
         dev = self.device
-        self.default_q = self.robot.data.default_joint_pos.torch[0].clone()
+        idx = self.robot.indexing
+        self._root_q, self._root_v = idx.free_joint_q_adr.long(), idx.free_joint_v_adr.long()
+        self._joint_q, self._joint_v = idx.joint_q_adr.long(), idx.joint_v_adr.long()
+        self.default_q = self.robot.data.default_joint_pos[0].clone()
         self.alpha = torch.tensor([action_scale(n) for n in G1_JOINT_NAMES], device=dev)
         self.torso_id = self.robot.find_bodies("torso_link")[0][0]
 
         # ---- sim context xi = [friction, joint offsets(29), torso com offset(3)] ----
         self.xi = torch.zeros(self.N, 33, device=dev)
-        self._setup_friction()
+        self._setup_model_fields()
         if eval_mode:
             self.xi[:, 0] = 1.0
         else:
@@ -80,8 +72,9 @@ class TrackingSim:
                 -1,
             )
             self.xi[:, 30:33] = com
-            default_com = self.robot.data.body_com_pose_b.torch[:, self.torso_id, :3].clone()
-            self.robot.set_coms_index(coms=(default_com + com).unsqueeze(1), body_ids=[self.torso_id])
+            torso = int(idx.body_ids[self.torso_id])
+            self.sim.model.body_ipos[:, torso] = self.sim.get_default_field("body_ipos")[torso] + com
+            self.sim.recompute_constants(RecomputeLevel.set_const)
         self._apply_friction()
 
         # ---- episode bookkeeping ----
@@ -98,29 +91,27 @@ class TrackingSim:
         self.failed_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.reset(torch.arange(self.N, device=dev))
 
-    # ------------------------------------------------------------------ friction
-    def _setup_friction(self):
-        mgr = self.sim.backend_manager
-        model = mgr.get_model()
-        self._mu_view = wp.to_torch(self.robot._root_view.get_attribute("shape_material_mu", model)[:, 0])
-        # ground shapes (body == -1): lowest friction of the range, since MuJoCo takes the max of a pair
-        shape_body = wp.to_torch(model.shape_body)
-        mu_all = wp.to_torch(model.shape_material_mu)
-        mu_all[shape_body < 0] = 0.3 if not self.eval_mode else 1.0
+    # ------------------------------------------------------------------ friction / CoM
+    def _setup_model_fields(self):
+        # per-environment copies of the randomized model fields (this re-captures the CUDA graphs)
+        self.sim.expand_model_fields(("geom_friction", "body_ipos"))
+        self._robot_geoms = self.robot.indexing.geom_ids[self.robot.find_geoms(".*_collision")[0]].long()
+        ground = self.scene.terrain.indexing.geom_ids.long()
+        # ground: lowest friction of the range, since MuJoCo takes the max of a pair
+        self.sim.model.geom_friction[:, ground, 0] = 0.3 if not self.eval_mode else 1.0
 
     def _apply_friction(self):
-        self._mu_view[:] = self.xi[:, :1]
-        self.sim.backend_manager.add_model_change(ModelFlags.SHAPE_PROPERTIES)
+        self.sim.model.geom_friction[:, self._robot_geoms, 0] = self.xi[:, :1]
 
     # ------------------------------------------------------------------ state
     def state(self):
-        d = self.robot.data
-        pose = d.root_link_pose_w.torch.clone()
-        vel = d.root_link_vel_w.torch.clone()
-        p = pose[:, :3] - self.scene.env_origins
-        quat = pose[:, 3:7]  # Isaac Lab 3 uses xyzw
-        R = quat_to_mat(torch.cat((quat[:, 3:4], quat[:, :3]), -1))
-        return (p, R, vel[:, :3], vel[:, 3:6], d.joint_pos.torch.clone(), d.joint_vel.torch.clone())
+        # read the pelvis free joint directly: qpos/qvel are current after both step and reset, whereas
+        # derived quantities (xpos, cvel) lag by one substep until the next forward()
+        qpos, qvel = self.sim.data.qpos, self.sim.data.qvel
+        root, root_v = qpos[:, self._root_q], qvel[:, self._root_v]  # pos + quat (wxyz); world lin vel + body ang vel
+        R = quat_to_mat(root[:, 3:7])
+        w = (R @ root_v[:, 3:6].unsqueeze(-1)).squeeze(-1)
+        return (root[:, :3] - self.scene.env_origins, R, root_v[:, :3], w, qpos[:, self._joint_q], qvel[:, self._joint_v])
 
     # ------------------------------------------------------------------ reset
     def sample_frames(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -161,13 +152,14 @@ class TrackingSim:
                  torch.empty(n, device=dev).uniform_(-0.78, 0.78)), -1)  # fmt: skip
             q = q + torch.empty_like(q).uniform_(-0.1, 0.1)
         q = torch.clamp(q, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
-        quat = mat_to_quat(R)
-        pose = torch.cat((p + self.scene.env_origins[env_ids], quat[:, 1:4], quat[:, 0:1]), -1)
-        self.robot.write_root_link_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
-        self.robot.write_root_link_velocity_to_sim_index(root_velocity=torch.cat((v, w), -1), env_ids=env_ids)
-        self.robot.write_joint_position_to_sim_index(position=q, env_ids=env_ids)
-        self.robot.write_joint_velocity_to_sim_index(velocity=qd, env_ids=env_ids)
-        self.robot.set_joint_position_target_index(target=q, env_ids=env_ids)
+        pose = torch.cat((p + self.scene.env_origins[env_ids], mat_to_quat(R)), -1)  # quat wxyz
+        self.sim.reset(env_ids)  # clears solver warm start, ctrl and applied forces of these worlds
+        self.scene.reset(env_ids)
+        self.robot.write_root_link_pose_to_sim(pose, env_ids=env_ids)
+        self.robot.write_root_link_velocity_to_sim(torch.cat((v, w), -1), env_ids=env_ids)
+        self.robot.write_joint_position_to_sim(q, env_ids=env_ids)
+        self.robot.write_joint_velocity_to_sim(qd, env_ids=env_ids)
+        self.robot.set_joint_position_target(q, env_ids=env_ids)
         self.f[env_ids] = frames
         self.ep_step[env_ids] = 0
         self.a_prev[env_ids] = 0.0
@@ -176,12 +168,10 @@ class TrackingSim:
         self.ep_ret[env_ids] = 0.0
         if not self.eval_mode:
             self.xi[env_ids, 1:30] = torch.empty(n, 29, device=dev).uniform_(-0.01, 0.01)
-        self.scene.reset(env_ids)
 
     def refresh(self):
-        """Propagate written states so that ``state()`` is consistent after a reset."""
-        self.sim.forward() if hasattr(self.sim, "forward") else None
-        self.scene.update(0.0)
+        """Recompute derived quantities (body poses, velocities) from qpos/qvel, e.g. after a reset."""
+        self.sim.forward()
 
     # ------------------------------------------------------------------ step
     def step(self, a: torch.Tensor) -> dict:
@@ -191,10 +181,11 @@ class TrackingSim:
         a_prev = self.a_prev.clone()
         ep_step = self.ep_step.clone()
         target = self.default_q + xi[:, 1:30] + self.alpha * a
-        self.robot.set_joint_position_target_index(target=target)
-        self.scene.write_data_to_sim()
-        self.sim.step(render=False)
-        self.scene.update(CONTROL_DT)
+        self.robot.set_joint_position_target(target)
+        for _ in range(DECIMATION):
+            self.scene.write_data_to_sim()
+            self.sim.step()
+            self.scene.update(PHYSICS_DT)
         S1 = self.state()
         f1 = f + 1
         r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True)

@@ -2,6 +2,8 @@
 
 import argparse
 import csv
+import glob
+import json
 import os
 
 import matplotlib
@@ -39,32 +41,36 @@ def main():
     ap.add_argument("run_dir")
     ap.add_argument("--out", default=None)
     ap.add_argument("--target", type=float, default=0.82)
+    ap.add_argument("--no_paper", action="store_true", help="omit the paper's LAFAN1 target and reference point")
     a = ap.parse_args()
     ev = read(os.path.join(a.run_dir, "eval.csv"))
     tr = read(os.path.join(a.run_dir, "train_log.csv"))
     ev.sort(key=lambda r: int(r["iteration"]))
+    evals = sorted(glob.glob(os.path.join(a.run_dir, "ckpt_*_eval.json")))
+    n_clips = len(json.load(open(evals[-1]))["per_clip"]) if evals else 40
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.2), facecolor=SURF)
     # (a) evaluation return
     ax = axes[0]
-    style(ax, "(a) Evaluation normalized return, 40 LAFAN1 clips", "normalized return")
+    style(ax, f"(a) Evaluation normalized return, {n_clips} clips", "normalized return")
     if ev:
         x = [float(r["train_wall_h"]) for r in ev]
         y = [float(r["norm_return"]) for r in ev]
         ax.plot(x, y, color=BLUE, lw=2, marker="o", ms=4.5, mec=SURF, mew=1.2, zorder=3)
-        hit = next((i for i, v in enumerate(y) if v >= a.target), None)
+        hit = None if a.no_paper else next((i for i, v in enumerate(y) if v >= a.target), None)
         if hit is not None:
             ax.annotate(f"{a.target} reached at {x[hit]:.2f} h\n(it {ev[hit]['iteration']}, saved {ev[hit]['saved_at'][11:16]} UTC)",
                         (x[hit], y[hit]), xytext=(-40, -70), textcoords="offset points", fontsize=8, color=INK,
                         arrowprops=dict(arrowstyle="-", color=INK2, lw=0.8))  # fmt: skip
         ax.annotate(f"{y[-1]:.3f}", (x[-1], y[-1]), xytext=(-4, 10), textcoords="offset points", fontsize=8, color=INK, ha="center")
-    ax.axhline(a.target, color=REF, lw=1, ls="--", zorder=1)
-    ax.text(0.01, a.target + 0.01, f"target {a.target} (paper Fig. 4a)", transform=ax.get_yaxis_transform(), fontsize=8, color=INK2)
-    ax.plot([1.2], [0.82], marker="D", ms=7, color=REF, mec=SURF, zorder=4)
-    ax.annotate("paper: 0.82 at 1.2 h (H100)", (1.2, 0.82), xytext=(-60, -22), textcoords="offset points", fontsize=8, color=INK2)
+    if not a.no_paper:
+        ax.axhline(a.target, color=REF, lw=1, ls="--", zorder=1)
+        ax.text(0.01, a.target + 0.01, f"target {a.target} (paper Fig. 4a)", transform=ax.get_yaxis_transform(), fontsize=8, color=INK2)
+        ax.plot([1.2], [0.82], marker="D", ms=7, color=REF, mec=SURF, zorder=4)
+        ax.annotate("paper: 0.82 at 1.2 h (H100)", (1.2, 0.82), xytext=(-60, -22), textcoords="offset points", fontsize=8, color=INK2)
     ax.set_ylim(0, 1)
     # (b) failed clips
     ax = axes[1]
-    style(ax, "(b) Failed clips in evaluation (of 40)", "clips terminated early")
+    style(ax, f"(b) Failed clips in evaluation (of {n_clips})", "clips terminated early")
     if ev:
         x = [float(r["train_wall_h"]) for r in ev]
         y = [int(r["n_failed"]) for r in ev]
@@ -72,10 +78,10 @@ def main():
         ax.annotate(f"{y[-1]}", (x[-1], y[-1]), xytext=(6, 4), textcoords="offset points", fontsize=8, color=INK)
         zero = next((i for i, v in enumerate(y) if v == 0), None)
         if zero is not None:
-            ax.annotate(f"40/40 succeed at {x[zero]:.2f} h\n(it {ev[zero]['iteration']}, saved {ev[zero]['saved_at'][11:16]} UTC)",
+            ax.annotate(f"{n_clips}/{n_clips} succeed at {x[zero]:.2f} h\n(it {ev[zero]['iteration']}, saved {ev[zero]['saved_at'][11:16]} UTC)",
                         (x[zero], 0), xytext=(-150, 70), textcoords="offset points", fontsize=8, color=INK,
                         arrowprops=dict(arrowstyle="-", color=INK2, lw=0.8))  # fmt: skip
-    ax.set_ylim(-0.5, 40.5)
+    ax.set_ylim(-0.5, n_clips + 0.5)
     # (c) training return
     ax = axes[2]
     style(ax, "(c) Training-episode normalized return", "mean normalized return per episode")

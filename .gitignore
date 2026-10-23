@@ -3,8 +3,8 @@
 __pycache__/
 *.pyc
 build_*.log
-# upstream checkout (pinned commit cloned by tools/setup.sh)
-IsaacLab/
+# uv environment
+.venv/
 # third-party data (downloaded by tools/download_data.sh) and generated assets
 data/
 # training runs: checkpoints, logs
@@ -16,3 +16,4 @@ logs/
 results/analysis/
 # third-party paper
 *.pdf
+uv.lock

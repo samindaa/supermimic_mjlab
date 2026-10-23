@@ -6,45 +6,46 @@ Usage: MUJOCO_GL=egl python tools/render.py traj.npz out.mp4 --clips dance1_subj
 
 import argparse
 import os
-import re
 import subprocess
 
 os.environ.setdefault("MUJOCO_GL", "egl")
-# use the NVIDIA EGL vendor (GPU) rather than Mesa's CPU rasterizer when the image does not register it
-_NV_EGL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docker", "10_nvidia.json")
-if os.path.exists(_NV_EGL):
-    os.environ.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", os.path.abspath(_NV_EGL))
 import mujoco
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-MJCF = os.path.join(ROOT, "data", "g1_description", "g1_29dof.xml")
+from mjlab.asset_zoo.robots.unitree_g1.g1_constants import G1_XML
 
-
-def two_robot_xml() -> str:
-    xml = open(MJCF).read()
-    xml = re.sub(r'meshdir="[^"]*"', 'meshdir="' + os.path.join(ROOT, 'data', 'g1_description') + '/"', xml)
-    body = xml[xml.index('<body name="pelvis"') : xml.index("</worldbody>")]
-    ghost = re.sub(r' name="([^"]+)"', r' name="ref_\1"', body)
-    ghost = re.sub(r'rgba="[^"]*"', 'rgba="0.35 0.65 1.0 0.25"', ghost)
-    ghost = re.sub(r' (contype|conaffinity|group)="[^"]*"', "", ghost)
-    ghost = ghost.replace("<geom ", '<geom contype="0" conaffinity="0" group="1" ')
-    scene = """
-    <light pos="0 0 6" dir="0 0 -1" directional="true" diffuse="0.8 0.8 0.8"/>
-    <geom name="floor" type="plane" size="0 0 0.05" material="grid" contype="0" conaffinity="0"/>
-    """
-    xml = xml.replace("</worldbody>", ghost + scene + "</worldbody>")
-    assets = """
+SCENE_XML = """
+<mujoco>
+  <visual><global offwidth="1920" offheight="1080"/><quality shadowsize="4096"/></visual>
+  <asset>
     <texture name="grid" type="2d" builtin="checker" rgb1="0.92 0.93 0.94" rgb2="0.80 0.82 0.85" width="512" height="512"/>
     <material name="grid" texture="grid" texrepeat="8 8" reflectance="0.1"/>
     <texture name="sky" type="skybox" builtin="gradient" rgb1="0.95 0.96 0.98" rgb2="0.75 0.8 0.88" width="256" height="256"/>
-    """
-    xml = xml.replace("<asset>", "<asset>" + assets, 1)
-    xml = xml.replace("<mujoco", '<mujoco', 1)
-    if "<visual>" not in xml:
-        xml = xml.replace("<asset>", '<visual><global offwidth="1280" offheight="720"/><quality shadowsize="4096"/></visual>\n  <asset>', 1)
-    return xml
+  </asset>
+  <worldbody>
+    <light pos="0 0 6" dir="0 0 -1" directional="true" diffuse="0.8 0.8 0.8"/>
+    <geom name="floor" type="plane" size="0 0 0.05" material="grid" contype="0" conaffinity="0"/>
+  </worldbody>
+</mujoco>
+"""
+
+
+def two_robot_model() -> mujoco.MjModel:
+    """The G1 (qpos 0:36) and a translucent, non-colliding reference ghost (qpos 36:72)."""
+    spec = mujoco.MjSpec.from_string(SCENE_XML)
+    robot = mujoco.MjSpec.from_file(str(G1_XML))
+    ghost = mujoco.MjSpec.from_file(str(G1_XML))
+    for g in ghost.geoms:
+        g.contype, g.conaffinity = 0, 0
+        g.material = ""
+        g.rgba = [0.35, 0.65, 1.0, 0.25]
+        g.group = 1 if g.group == 2 else g.group  # visual meshes stay visible, collision geoms stay hidden
+    for el in list(ghost.lights) + list(ghost.cameras):
+        ghost.delete(el)
+    for child, prefix in ((robot, ""), (ghost, "ref_")):
+        spec.attach(child, prefix=prefix, frame=spec.worldbody.add_frame())
+    return spec.compile()
 
 
 def main():
@@ -63,7 +64,7 @@ def main():
 
     d = dict(np.load(a.traj))
     names = list(d["names"])
-    model = mujoco.MjModel.from_xml_string(two_robot_xml())
+    model = two_robot_model()
     model.vis.headlight.ambient[:] = 0.45
     model.vis.headlight.diffuse[:] = 0.55
     data = mujoco.MjData(model)
@@ -106,7 +107,7 @@ def main():
             label = f"{a.title}  {clip}  t={(f - int(d['clip_start'][c])) * 0.02:5.1f}s"
             if fell_at is not None:
                 label += "  [terminated]"
-            for xy, txt in (((16, 12), label), ((16, a.height - 38), "solid: simulated G1 policy (Isaac Lab + MuJoCo-Warp)   blue ghost: reference")):
+            for xy, txt in (((16, 12), label), ((16, a.height - 38), "solid: simulated G1 policy (mjlab + MuJoCo-Warp)   blue ghost: reference")):
                 bb = draw.textbbox(xy, txt, font=font)
                 draw.rectangle((bb[0] - 6, bb[1] - 4, bb[2] + 6, bb[3] + 4), fill=(255, 255, 255))
                 draw.text(xy, txt, fill=(20, 20, 20), font=font)

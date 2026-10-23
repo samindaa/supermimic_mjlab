@@ -1,4 +1,9 @@
-"""Reference motion library: LAFAN1 G1 retargets resampled to 50 Hz, with FK of tracked bodies."""
+"""Reference motion library: LAFAN1 G1 retargets resampled to 50 Hz, with FK of tracked bodies.
+
+Clips are LAFAN1 retarget CSVs (30 fps rows: root pos, root quat xyzw, 29 joint angles) or mjlab
+motion NPZs (``mjlab.scripts.csv_to_npz``: 50 fps, pelvis = body 0, quaternions wxyz). NPZs that store
+``joint_names``/``body_names`` (e.g. a G1 with hands) are reduced to the 29 body joints by name.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +14,7 @@ import numpy as np
 import torch
 
 from .kinematics import G1Kinematics
+from .robot import G1_JOINT_NAMES
 from .rotations import mat_to_6d, quat_slerp, quat_to_mat, so3_log, yaw_mat
 
 CONTROL_DT = 0.02
@@ -16,20 +22,32 @@ BIN_FRAMES = 50  # 1 s bins for return-based reset sampling
 
 
 class MotionLib:
-    def __init__(self, files: list[str], kin: G1Kinematics, device: str, src_fps: float = 30.0):
+    def __init__(self, files: list[str], kin: G1Kinematics, device: str, src_fps: float = 30.0, names: list[str] | None = None):
         self.device = device
-        self.names = [os.path.splitext(os.path.basename(f))[0] for f in files]
+        self.names = names or [os.path.splitext(os.path.basename(f))[0] for f in files]
         ps, qs, js = [], [], []
         lens = []
         for f in files:
-            raw = torch.tensor(np.loadtxt(f, delimiter=","), dtype=torch.float32)
-            p, q_xyzw, j = raw[:, :3], raw[:, 3:7], raw[:, 7:36]
-            quat = torch.cat((q_xyzw[:, 3:4], q_xyzw[:, :3]), -1)
+            if f.endswith(".npz"):
+                d = np.load(f)
+                body_p, body_quat, j = (torch.tensor(d[k], dtype=torch.float32) for k in ("body_pos_w", "body_quat_w", "joint_pos"))
+                if "joint_names" in d.files:  # select our joints / bodies by name (drops e.g. hand joints)
+                    jn, bn = list(d["joint_names"]), list(d["body_names"])
+                    j = j[:, [jn.index(n) for n in G1_JOINT_NAMES]]
+                    bi = [bn.index(n) for n in kin.body_names]
+                    body_p, body_quat = body_p[:, bi], body_quat[:, bi]
+                _check_body_order(kin, body_p, body_quat[:, 0], j, f)
+                p, quat, fps = body_p[:, 0], body_quat[:, 0], float(np.asarray(d["fps"]).reshape(-1)[0])
+            else:
+                raw = torch.tensor(np.loadtxt(f, delimiter=","), dtype=torch.float32)
+                p, q_xyzw, j = raw[:, :3], raw[:, 3:7], raw[:, 7:36]
+                quat = torch.cat((q_xyzw[:, 3:4], q_xyzw[:, :3]), -1)
+                fps = src_fps
             # resample to 50 Hz
-            T_src = raw.shape[0]
-            dur = (T_src - 1) / src_fps
+            T_src = p.shape[0]
+            dur = (T_src - 1) / fps
             n = int(np.floor(dur / CONTROL_DT)) + 1
-            t = torch.arange(n, dtype=torch.float32) * CONTROL_DT * src_fps
+            t = torch.arange(n, dtype=torch.float32) * CONTROL_DT * fps
             i0 = torch.clamp(t.floor().long(), max=T_src - 2)
             a = (t - i0.float()).clamp(0, 1)
             p = p[i0] * (1 - a[:, None]) + p[i0 + 1] * a[:, None]
@@ -88,8 +106,11 @@ class MotionLib:
 
     @staticmethod
     def from_dir(path: str, kin: G1Kinematics, device: str) -> MotionLib:
-        files = sorted(glob.glob(os.path.join(path, "*.csv")))
-        return MotionLib(files, kin, device)
+        files = sorted(glob.glob(os.path.join(path, "*.csv"))) or sorted(glob.glob(os.path.join(path, "**", "*.npz"), recursive=True))
+        if not files:
+            raise FileNotFoundError(f"no *.csv or *.npz motions in {path}")
+        names = [os.path.splitext(os.path.relpath(f, path))[0].replace("/clips/", "/") for f in files]
+        return MotionLib(files, kin, device, names=names)
 
     def future_frames(self, f: torch.Tensor, K: int) -> torch.Tensor:
         """Frames f+1..f+K clamped to the clip's last frame, shape (B, K)."""
@@ -111,6 +132,17 @@ class MotionLib:
 
     def ref_state(self, f: torch.Tensor):
         return self.root_p[f], self.root_R[f], self.root_v[f], self.root_w[f], self.q[f], self.qd[f]
+
+
+def _check_body_order(kin: G1Kinematics, body_p: torch.Tensor, root_quat: torch.Tensor, q: torch.Tensor, path: str):
+    """FK of an NPZ clip's root pose and joints must reproduce its body positions; another joint order does not."""
+    sub = lambda x: x[::25].to(kin.device)  # noqa: E731
+    zero = torch.zeros_like(sub(q))
+    if body_p.shape[1] == kin.num_bodies:
+        P = kin.forward(sub(body_p)[:, 0], quat_to_mat(sub(root_quat)), zero[:, :3], zero[:, :3], sub(q), zero, all_bodies=True)[0]
+        if (P - sub(body_p)).norm(dim=-1).max() < 1e-2:
+            return
+    raise ValueError(f"{path}: body positions disagree with the G1 FK; joints and bodies must be in mjlab's G1 order (mjlab csv_to_npz)")
 
 
 def _gradient(x: torch.Tensor, dt: float) -> torch.Tensor:

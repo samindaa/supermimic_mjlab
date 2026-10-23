@@ -21,3 +21,12 @@ Times are local time (CEST, UTC+2) unless marked UTC. One GPU (RTX PRO 6000 Blac
 | 2026-10-21 19:23 | **REPRODUCED (both criteria)**: it 14000, 1.47 h train time (ckpt saved 2026-10-21 17:19:24 UTC = 19:19 CEST): eval normalized return 0.829 >= 0.82 AND 0/40 clips failed |
 | 2026-10-21 19:31 | Training stopped by request at it ~15700 (1.67 h train time); last checkpoint ckpt_014000 (the 40/40 one) |
 | 2026-10-21 19:44 | Reproduction video rendered (results/supermimic_lafan1_it14000_reproduced.mp4); container removed, GPU released |
+
+## Port to mjlab 1.6 (uv, CUDA 12.4 driver)
+One RTX 6000 Ada, driver 550.163.01 (CUDA 12.4); torch 2.10.0 (CUDA 12.8 build), warp-lang 1.17.0, mujoco-warp 3.11.0.
+
+| Time | Milestone |
+|---|---|
+| 2026-10-23 | Isaac Lab / Newton / Docker replaced by mjlab 1.6 (`Scene` + `Simulation`, mjlab's G1); uv project with CUDA 12 pins |
+| 2026-10-23 | `tools/test_env.py`: state round-trip exact, FK vs. simulator link poses/velocities agree to ~1e-7; ~550k control steps/s at 4096 envs |
+| 2026-10-23 | Verification run (4000 it): eval return 0.544, 13/40 failed at it 2000 (Isaac Lab: 0.541, 12/40); 0.732, 4/40 failed at it 4000 (Isaac Lab: 0.685, 4/40) |

@@ -1,0 +1,29 @@
+[project]
+name = "supermimic"
+version = "0.2.0"
+description = "Unofficial SuperMimic reproduction (G1, LAFAN1) on mjlab / MuJoCo-Warp"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "mjlab==1.6.0",
+  "absl-py",
+  # Builds for CUDA 12.x, which run on CUDA 12.4 drivers (R550) through CUDA minor version
+  # compatibility. From torch 2.11 and warp-lang 1.18 on, the PyPI wheels are CUDA 13 builds,
+  # which need driver >= 580. torch 2.8-2.10 are CUDA 12.8 builds; warp-lang 1.14-1.17 CUDA 12.9.
+  "torch>=2.7,<2.11",
+  "warp-lang>=1.14,<1.18",
+  "numpy",
+  "matplotlib",
+  "pillow",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["supermimic"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]

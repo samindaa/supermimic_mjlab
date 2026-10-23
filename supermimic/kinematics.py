@@ -1,4 +1,4 @@
-"""Differentiable forward kinematics of the G1 in torch, built from the compiled MJCF.
+"""Differentiable forward kinematics of the G1 in torch, built from the simulated MJCF (mjlab's G1).
 
 The same FK computes tracked-body poses and velocities for the reference motion, for logged
 simulator states, and for world-model predictions, so the analytic reward head matches the

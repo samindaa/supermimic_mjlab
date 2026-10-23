@@ -1,42 +1,23 @@
-"""Unitree G1 (29 DoF) articulation, following BeyondMimic's actuator model.
+"""Unitree G1 (29 DoF) entity on mjlab, following BeyondMimic's actuator model.
 
-The URDF is the one the LAFAN1 motions were retargeted to (g1_29dof_rev_1_0). Joint drives are
-implicit PD with a 10 Hz natural frequency and damping ratio 2 on the reflected motor armature, and
-the action scale is 0.25 * effort_limit / stiffness, as in BeyondMimic.
+The MJCF is mjlab's ``g1_29dof_rev_1_0``, the revision the LAFAN1 motions were retargeted to. Joint
+drives are MuJoCo position actuators with a 10 Hz natural frequency and damping ratio 2 on the
+reflected motor armature (mjlab's ``G1_ARTICULATION``, ported from BeyondMimic), and the action
+scale is 0.25 * effort_limit / stiffness, as in BeyondMimic.
 """
 
 from __future__ import annotations
 
-import os
+import re
 
-import isaaclab.sim as sim_utils
-from isaaclab.actuators import ImplicitActuatorCfg
-from isaaclab.assets import ArticulationCfg
+from mjlab.asset_zoo.robots.unitree_g1 import g1_constants as g1
+from mjlab.entity import EntityCfg
+from mjlab.utils.spec_config import CollisionCfg
+from mjlab.utils.string import resolve_expr
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-URDF_PATH = os.path.join(DATA_DIR, "g1_description", "g1_29dof_rev_1_0.urdf")
-MJCF_PATH = os.path.join(DATA_DIR, "g1_description", "g1_29dof.xml")
-USD_DIR = os.path.join(DATA_DIR, "g1_usd")
-USD_PATH = os.path.join(USD_DIR, "g1_29dof", "g1_29dof.usda")
+MJCF_PATH = str(g1.G1_XML)
 
-ARMATURE_5020 = 0.003609725
-ARMATURE_7520_14 = 0.010177520
-ARMATURE_7520_22 = 0.025101925
-ARMATURE_4010 = 0.00425
-
-NATURAL_FREQ = 10 * 2.0 * 3.1415926535  # 10 Hz
-DAMPING_RATIO = 2.0
-
-
-def _kp(arm):
-    return arm * NATURAL_FREQ**2
-
-
-def _kd(arm):
-    return 2.0 * DAMPING_RATIO * arm * NATURAL_FREQ
-
-
-# Joint order of the LAFAN1 retarget CSVs (Unitree SDK order).
+# Joint order of the LAFAN1 retarget CSVs (Unitree SDK order); also the MJCF / mjlab joint order.
 G1_JOINT_NAMES = [
     "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", "left_knee_joint",
     "left_ankle_pitch_joint", "left_ankle_roll_joint",
@@ -57,90 +38,35 @@ TRACKED_BODIES = [
     "right_shoulder_roll_link", "right_elbow_link", "right_wrist_yaw_link",
 ]  # fmt: skip
 
-# Per-joint (effort limit, velocity limit, armature) by motor type.
-_M5020 = (25.0, 37.0, ARMATURE_5020)
-_M4010 = (5.0, 22.0, ARMATURE_4010)
-JOINT_MOTORS = {
-    "hip_pitch": (88.0, 32.0, ARMATURE_7520_14),
-    "hip_roll": (139.0, 20.0, ARMATURE_7520_22),
-    "hip_yaw": (88.0, 32.0, ARMATURE_7520_14),
-    "knee": (139.0, 20.0, ARMATURE_7520_22),
-    "ankle_pitch": (50.0, 37.0, 2.0 * ARMATURE_5020),
-    "ankle_roll": (50.0, 37.0, 2.0 * ARMATURE_5020),
-    "waist_yaw": (88.0, 32.0, ARMATURE_7520_14),
-    "waist_roll": (50.0, 37.0, 2.0 * ARMATURE_5020),
-    "waist_pitch": (50.0, 37.0, 2.0 * ARMATURE_5020),
-    "shoulder_pitch": _M5020,
-    "shoulder_roll": _M5020,
-    "shoulder_yaw": _M5020,
-    "elbow": _M5020,
-    "wrist_roll": _M5020,
-    "wrist_pitch": _M4010,
-    "wrist_yaw": _M4010,
-}
+# BeyondMimic's knees-bent default pose (pelvis at 0.76 m).
+INIT_STATE = g1.KNEES_BENT_KEYFRAME
 
 
-def motor_of(joint_name: str) -> tuple[float, float, float]:
-    key = joint_name.replace("left_", "").replace("right_", "").replace("_joint", "")
-    return JOINT_MOTORS[key]
+def _actuator_of(joint_name: str):
+    for act in g1.G1_ARTICULATION.actuators:
+        if any(re.fullmatch(p, joint_name) for p in act.target_names_expr):
+            return act
+    raise KeyError(joint_name)
 
 
 def action_scale(joint_name: str) -> float:
-    effort, _, arm = motor_of(joint_name)
-    return 0.25 * effort / _kp(arm)
-
-
-DEFAULT_JOINT_POS = {
-    ".*_hip_pitch_joint": -0.312,
-    ".*_knee_joint": 0.669,
-    ".*_ankle_pitch_joint": -0.363,
-    ".*_elbow_joint": 0.6,
-    "left_shoulder_roll_joint": 0.2,
-    "left_shoulder_pitch_joint": 0.2,
-    "right_shoulder_roll_joint": -0.2,
-    "right_shoulder_pitch_joint": 0.2,
-}
+    act = _actuator_of(joint_name)
+    return 0.25 * act.effort_limit / act.stiffness
 
 
 def default_joint_pos_list() -> list[float]:
-    import re
-
-    out = []
-    for name in G1_JOINT_NAMES:
-        val = 0.0
-        for pat, v in DEFAULT_JOINT_POS.items():
-            if re.fullmatch(pat, name):
-                val = v
-        out.append(val)
-    return out
+    return list(resolve_expr(INIT_STATE.joint_pos, tuple(G1_JOINT_NAMES), 0.0))
 
 
-def _actuators() -> dict[str, ImplicitActuatorCfg]:
-    acts = {}
-    for name in G1_JOINT_NAMES:
-        effort, vel, arm = motor_of(name)
-        acts[name.replace("_joint", "")] = ImplicitActuatorCfg(
-            joint_names_expr=[name],
-            effort_limit_sim=effort,
-            velocity_limit_sim=vel,
-            stiffness=_kp(arm),
-            damping=_kd(arm),
-            armature=arm,
-        )
-    return acts
+# Robot-ground contacts only (self-collisions disabled, for speed), with friction on every contact so
+# that the per-environment friction of the sim context applies to all of them.
+GROUND_ONLY_COLLISION = CollisionCfg(geom_names_expr=(".*_collision",), contype=0, conaffinity=1, condim=3, priority=0)
 
 
-G1_CFG = ArticulationCfg(
-    # USD generated by tools/urdf_to_mjcf.py + tools/mjcf_to_usd.py (the kit-less importers cannot
-    # register PhysxSchema inside a running Isaac Lab process, so conversion is a separate step).
-    spawn=sim_utils.UsdFileCfg(
-        usd_path=USD_PATH,
-        variants={"Physics": "mujoco"},
-        activate_contact_sensors=False,
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False, linear_damping=0.0, angular_damping=0.0),
-        articulation_props=sim_utils.ArticulationRootPropertiesCfg(enabled_self_collisions=False),
-    ),
-    init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, 0.76), joint_pos=DEFAULT_JOINT_POS, joint_vel={".*": 0.0}),
-    soft_joint_pos_limit_factor=0.9,
-    actuators=_actuators(),
-)
+def g1_cfg() -> EntityCfg:
+    return EntityCfg(
+        init_state=INIT_STATE,
+        collisions=(GROUND_ONLY_COLLISION,),
+        spec_fn=g1.get_spec,
+        articulation=g1.G1_ARTICULATION,
+    )
